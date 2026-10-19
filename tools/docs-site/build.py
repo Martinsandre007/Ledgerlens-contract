@@ -16,11 +16,15 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 DOCS = ROOT / "docs"
+ARTIFACTS_INDEX = DOCS / "artifacts-index.md"
+ARTIFACTS_CHECKER = ROOT / "tools/artifacts-index/check.py"
 
 # First matching keyword wins; unmatched pages land under "Reference".
 AUDIENCES = [
@@ -59,11 +63,33 @@ def audience(rel: str) -> str:
     return "Reference"
 
 
+def check_artifacts_index() -> None:
+    """Fail the docs build if the artifact index is stale or incomplete (issue #1457)."""
+    if not ARTIFACTS_INDEX.exists():
+        sys.exit(f"error: {ARTIFACTS_INDEX.relative_to(ROOT)} is missing")
+    if not ARTIFACTS_CHECKER.exists():
+        sys.exit(f"error: {ARTIFACTS_CHECKER.relative_to(ROOT)} is missing")
+    result = subprocess.run(
+        [sys.executable, str(ARTIFACTS_CHECKER), "--check"],
+        cwd=ROOT,
+    )
+    if result.returncode != 0:
+        sys.exit(
+            "error: artifact index freshness/completeness check failed; "
+            "regenerate docs/artifacts-index.md and add any missing artifacts"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "target/docs-site"))
     ap.add_argument("--version", default="latest", help="site version label, e.g. v1.2.0 or latest")
+    ap.add_argument("--skip-artifacts-check", action="store_true",
+                    help="skip the artifact index freshness/completeness check")
     args = ap.parse_args()
+
+    if not args.skip_artifacts_check:
+        check_artifacts_index()
 
     out = Path(args.out)
     src = out / "src"
@@ -91,6 +117,8 @@ def main() -> None:
         groups[audience(rel)].append((title(page), rel))
 
     lines = ["# Summary", "", "[Introduction](introduction.md)", ""]
+    if (src / "artifacts-index.md").exists():
+        lines += ["# Artifacts", "", "- [Machine-readable artifacts](artifacts-index.md)", ""]
     for name, pages in groups.items():
         if not pages:
             continue

@@ -252,10 +252,24 @@ model check or the existing refinement mapping consistency check.
 
 Any invariant violation TLC produces should be converted into a Rust regression test targeting `contracts/ledgerlens-score/src/` and filed as a bug against the Rust implementation — **not** silently patched in the spec alone. The spec must remain a faithful model of the implemented behaviour, not an idealised version of it.
 
+## Randomized / Statistical Model-Checking Spike (issue #1454)
+
+A spike evaluated whether randomized or statistical exploration of the TLA+
+model itself (as a complement to TLC's exhaustive bounded checking) is worth
+adopting as a standing periodic check. It surveys the available tooling,
+records a prototype run against `spec/LedgerLens.tla` at a configuration larger
+than `LedgerLens.cfg`, compares cost against simply raising the exhaustive
+bounds, and gives a recommendation. See
+[`docs/spike-randomized-tla-model-checking.md`](../docs/spike-randomized-tla-model-checking.md).
+
+The spike does **not** change the existing `spec-model-check` CI job; any
+adoption is scoped as explicit follow-up work in that document.
+
 ## References
 
 - `spec/LedgerLens.tla` — The abstract TLA+ specification
 - `spec/LedgerLens.cfg` — TLC model-checking configuration
+- [`docs/spike-randomized-tla-model-checking.md`](../docs/spike-randomized-tla-model-checking.md) — Randomized/statistical model-checking spike (issue #1454)
 - [`spec/refinement-mapping.md`](refinement-mapping.md) — **Refinement mapping: how Rust storage keys and structs correspond to TLA+ variables** (issue #754)
 - `contracts/ledgerlens-score/src/types.rs` — All storage key enums (`DataKey`, `DataKeyB`, `DataKeyC`, `DataKeyD`)
 - `contracts/ledgerlens-score/src/storage.rs` — Storage read/write helpers

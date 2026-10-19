@@ -23,6 +23,23 @@ and the glossary. It never reads the contract source. It serves two purposes:
 Out of scope for now: multisig/consensus, embargo, delegation, finality buffer, rate limiting.
 The generator always advances past the 1-hour cooldown before submitting.
 
+## Coverage of the model itself
+
+Claiming to model an operation is only meaningful if the fixtures actually exercise that operation's
+real input space. [`COVERAGE.md`](COVERAGE.md) audits every operation listed above: it characterizes
+what the current unit tests and differential generator actually exercise for each one, compares that
+against the operation's real input space (including documented boundary and adversarial values), and
+records where coverage was materially narrow and how it was extended. It also records any genuine
+model/contract disagreement that the extended coverage surfaced, and on which side it was fixed.
+
+**Bar for future additions.** Any new operation, branch or validation rule added to the reference
+model must ship with fixtures that exercise a genuinely representative range of inputs for it, not
+just the happy path: documented boundaries (inclusive/exclusive edges, zero, max, saturation points),
+adversarial values (out-of-range, stale, exactly-at-threshold, off-by-one), and the property-based
+generator wired up to produce them. Add the new row to `COVERAGE.md` in the same change; a modeled
+function without a characterized, representative fixture set is treated as a coverage gap.
+=======
+
 ## Usage
 
 ```bash ignore
@@ -46,3 +63,6 @@ assert m.gate(0, "XLM_USDC", 70, 80)  # 60 < 70 and 90 >= 80
 The nightly workflow `.github/workflows/reference-model.yml` runs 100,000 sequences with a fresh seed
 each night. On a failure, the run prints the shortest failing op sequence per operation type. Record
 it in `DISAGREEMENTS.md` and classify it before changing the code, the docs, or the model.
+
+When you add or change a modeled operation, update [`COVERAGE.md`](COVERAGE.md) alongside the code so
+the claimed coverage and the fixtures that back it stay in sync.

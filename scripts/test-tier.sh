@@ -17,6 +17,13 @@
 #     --fail-fast     stop at the first failing unit instead of running the tier
 #     --list          print the units in the tier and exit
 #     --dry-run       print the commands the tier would run and exit
+#     --verify-runtime
+#                     after the tier runs, independently re-measure the actual
+#                     runtime of every unit in the tier and flag any unit that
+#                     exceeds the tier's budget by a meaningful margin, no matter
+#                     how it was classified. A flag is a hard failure: it prints
+#                     an attributable re-classification proposal and requires a
+#                     review (see docs/test-tiers.md). Implied for `fast`.
 #     -- <args>       extra arguments appended to every command in the tier
 #                     (e.g. `-- --nocapture`, `-- --test-threads=1`)
 #
@@ -47,6 +54,7 @@ ENFORCE_BUDGET=1
 DO_BUILD=1
 FAIL_FAST=0
 MODE=run
+VERIFY_RUNTIME=0
 EXTRA=()
 
 usage() {
@@ -62,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --fail-fast) FAIL_FAST=1; shift ;;
         --list) MODE=list; shift ;;
         --dry-run) MODE=dry-run; shift ;;
+        --verify-runtime) VERIFY_RUNTIME=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; EXTRA=("$@"); break ;;
         *) echo "test-tier: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
@@ -84,6 +93,14 @@ OUT_DIR="target/test-tiers"
 LOG_DIR="$OUT_DIR/logs/$TIER"
 RESULTS="$OUT_DIR/$TIER-results.tsv"
 REPORT="$OUT_DIR/$TIER-report.md"
+VERIFY_REPORT="$OUT_DIR/$TIER-runtime-verify.md"
+
+# The fast tier is the one whose whole point is a tight budget, so its runtime
+# verification is not optional: a slow test wearing fast-tier markers must never
+# slip through a plain `scripts/test-tier.sh fast`.
+if [[ "$TIER" == "fast" ]]; then
+    VERIFY_RUNTIME=1
+fi
 PLAN="$(mktemp)"
 trap 'rm -f "$PLAN"' EXIT
 
@@ -188,9 +205,39 @@ REPORT_ARGS=(report --tier "$TIER" --results "$RESULTS" --output "$REPORT"
 $TIERING "${REPORT_ARGS[@]}"
 STATUS=$?
 
+# ── 5. independent runtime verification ───────────────────────────────────────
+# The report above trusts the tier a unit was classified into. This step does
+# not: it re-measures each unit's actual runtime and flags anything that blows
+# the tier's budget, regardless of how it was classified. A flag is a hard
+# failure with an attributable, review-requiring proposal — never a silent note.
+if [[ "$VERIFY_RUNTIME" == "1" && "$STOPPED" == "0" ]]; then
+    echo ""
+    echo "==> verifying actual runtime of tier '$TIER' units (independent of classification)"
+    VERIFY_ARGS=(verify-runtime --tier "$TIER" --results "$RESULTS"
+                 --output "$VERIFY_REPORT")
+    [[ -n "$BASE" ]] && VERIFY_ARGS+=(--base "$BASE")
+
+    $TIERING "${VERIFY_ARGS[@]}"
+    VERIFY_STATUS=$?
+
+    if [[ "$VERIFY_STATUS" -ne 0 ]]; then
+        echo "" >&2
+        echo "test-tier: RUNTIME VERIFICATION FAILED for tier '$TIER'." >&2
+        echo "test-tier: one or more units exceed the '$TIER' budget despite their" >&2
+        echo "test-tier: classification. This requires review and a re-classification" >&2
+        echo "test-tier: proposal; see $VERIFY_REPORT" >&2
+        echo "test-tier: (proposal: move the flagged unit(s) to a slower tier in" >&2
+        echo "test-tier:  test-tiers.toml, or make them genuinely fast)." >&2
+        STATUS=1
+    fi
+fi
+
 echo ""
 if [[ "$UNIT_COUNT" -gt 0 ]]; then
     echo "test-tier: $TIER ran $UNIT_COUNT unit(s), $FAILED failure(s)."
 fi
 echo "test-tier: report written to $REPORT"
+if [[ "$VERIFY_RUNTIME" == "1" ]]; then
+    echo "test-tier: runtime verification written to $VERIFY_REPORT"
+fi
 exit "$STATUS"

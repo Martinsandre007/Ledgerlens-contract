@@ -2,6 +2,22 @@ name: Reference model differential test
 
 # Issue #1240: compare the independent Python reference model against the
 # contract on 100,000 generated operation sequences every night.
+#
+# Issue #1455: the reference model is only as valuable as the completeness of
+# what it actually models. Every function the model claims to cover must be
+# exercised by fixtures spanning a genuinely representative range of its input
+# space (including documented boundary and adversarial values), not just the
+# narrow slice the original fixtures happened to hit. The per-function
+# characterization of fixture coverage versus real input space is published in
+# the coverage report at:
+#
+#     tools/reference-model/COVERAGE.md
+#
+# Any newly modeled function MUST ship with representative fixture coverage and
+# a corresponding entry in that coverage report; additions that claim coverage
+# without it will be held to the same bar and rejected in review. See the
+# coverage report for the current mapping of each modeled function to its
+# fixture coverage characterization.
 
 on:
   schedule:
@@ -28,6 +44,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.81.0
       - uses: Swatinem/rust-cache@v2
       - name: Reference model unit tests
+        # Fixture coverage for every modeled function is characterized in
+        # tools/reference-model/COVERAGE.md (see issue #1455).
         run: python3 -m unittest discover -v tools/reference-model
       - name: Build contract driver
         run: cargo build --release --locked -p reference-model-driver

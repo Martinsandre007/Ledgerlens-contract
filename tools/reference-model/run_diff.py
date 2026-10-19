@@ -21,30 +21,47 @@ import ledgerlens_ref as ref
 
 HERE = Path(__file__).resolve().parent
 PAIRS = ["XLM_USDC", "BTC_USDC", "ETH_XLM"]
+# Pairs the contract does not model; get/eff/agg must handle these gracefully.
+MISSING_PAIRS = ["DOGE_USDC", "SOL_XLM", "UNKNOWN_PAIR"]
 
 
 def gen_op(rng: random.Random) -> dict:
-    w, p = rng.randrange(3), rng.choice(PAIRS)
+    w = rng.randrange(3)
+    # Occasionally target a pair the contract does not model so get/eff/agg
+    # exercise their missing-pair path rather than only known pairs.
+    p = rng.choice(MISSING_PAIRS) if rng.random() < 0.15 else rng.choice(PAIRS)
     k = rng.choices(
         ["advance", "submit", "weight", "decay", "floor", "get", "eff", "agg", "gate"],
         [2, 5, 1, 1, 1, 2, 2, 2, 3],
     )[0]
     if k == "advance":
-        return {"op": k, "secs": rng.choice([3_601, 86_400, 604_801, 2_592_000])}
+        return {"op": k, "secs": rng.choice([0, 1, 3_600, 3_601, 86_400, 604_801, 2_592_000])}
     if k == "submit":
-        return {"op": k, "w": w, "p": p, "score": rng.choice([0, 1, 50, 99, 100, 101, rng.randrange(120)]),
-                "conf": rng.choice([0, 50, 100, 101, rng.randrange(120)])}
+        # score/conf: documented bounds are 0..=100; include both edges and the
+        # just-out-of-range adversarial values 101 and large randoms.
+        return {"op": k, "w": w, "p": p,
+                "score": rng.choice([0, 1, 50, 99, 100, 101, 255, rng.randrange(120)]),
+                "conf": rng.choice([0, 1, 50, 99, 100, 101, 255, rng.randrange(120)])}
     if k == "weight":
-        return {"op": k, "p": p, "weight": rng.choice([0, 1, 2, 5, 10])}
+        # weight extremes: zero, unit, and the documented max plus overshoot.
+        return {"op": k, "p": p, "weight": rng.choice([0, 1, 2, 5, 10, 11, 255])}
     if k == "decay":
-        return {"op": k, "num": rng.choice([0, 1, 2]), "den": rng.choice([1_000_000, 2_592_000, 10_000_000])}
+        # num/den edge cases: zero numerator, unit denominator, den == num,
+        # and the documented max window plus overshoot.
+        num = rng.choice([0, 1, 2, 3, 2_592_000])
+        den = rng.choice([1, 2, 1_000_000, 2_592_000, 10_000_000])
+        return {"op": k, "num": num, "den": den}
     if k == "floor":
-        return {"op": k, "v": rng.choice([0, 50, 75, 100, 101])}
+        # floor bounds are 0..=100; include both edges and adversarial 101.
+        return {"op": k, "v": rng.choice([0, 1, 50, 75, 99, 100, 101, 255])}
     if k in ("get", "eff"):
         return {"op": k, "w": w, "p": p}
     if k == "agg":
         return {"op": k, "w": w}
-    return {"op": k, "w": w, "p": p, "t": rng.choice([0, 40, 70, 100]), "q": rng.choice([0, 50, 80, 100])}
+    # gate: thresholds and confidences at and around documented boundaries.
+    return {"op": k, "w": w, "p": p,
+            "t": rng.choice([0, 1, 40, 70, 99, 100, 101]),
+            "q": rng.choice([0, 1, 50, 79, 80, 99, 100, 101])}
 
 
 def gen_seq(rng: random.Random) -> list[dict]:

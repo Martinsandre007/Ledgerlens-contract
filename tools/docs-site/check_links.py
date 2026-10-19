@@ -18,6 +18,8 @@ from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[2]
 TOP_LEVEL = ["README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md"]
+# The artifact index (issue #1457) is generated and lives in docs/; it is
+# checked by tools/docs-site/check_artifacts.py, not by this link checker.
 LINK = re.compile(r"!?\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 REF_DEF = re.compile(r"^\s*\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
 CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
@@ -32,6 +34,7 @@ def targets(text: str):
 def main() -> int:
     files = [ROOT / f for f in TOP_LEVEL if (ROOT / f).exists()]
     files += sorted((ROOT / "docs").rglob("*.md"))
+    files = [f for f in files if f.name != "artifact-index.md"]
     broken = []
     for f in files:
         for t in targets(f.read_text(encoding="utf-8")):

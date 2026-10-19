@@ -1059,6 +1059,22 @@ tier = "fast"
 command = "bash tests/test_tiers.test.sh"
 note = "hand-classified: the gate that decides what runs is itself on the fast path, so a regression in the checker cannot wait for a review cycle"
 
+# ── Seeded regression fixture for the runtime-verification step ───────────────
+#
+# This unit is deliberately slow but is declared with fast-tier markers (a
+# `smoke` kind, the fast tier, and a fast-tier-looking id). It exists so the
+# independent runtime-verification step (`tools/test-tiering.py verify-runtime`,
+# wired into `tests/test_tiers.test.sh`) has a real, committed fixture it must
+# flag. If the verifier ever stops catching a slow test disguised as fast, this
+# entry makes the tool's own suite fail. Do not "fix" its tier: the mismatch is
+# the point. See docs/test-tiers.md § Runtime verification.
+[[unit]]
+id = "tests/fixtures/test_seeded_slow_fast_tier.sh"
+kind = "smoke"
+tier = "fast"
+command = "bash tests/fixtures/test_seeded_slow_fast_tier.sh"
+note = "seeded regression fixture: intentionally slow while wearing fast-tier markers; the runtime verifier must flag it (issue #1456)"
+
 [[unit]]
 id = "tests/test_traceability.py"
 kind = "unit"

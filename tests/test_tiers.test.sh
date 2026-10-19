@@ -13,6 +13,10 @@
 #   5. a --base revision predating the manifest       -> exit 0, with a notice
 #   6. a tier over budget / a failing unit / a unit that never ran
 #                                                    -> report exits 1
+#   7. a deliberately slow test disguised with fast-tier markers
+#      (a fast-looking name and a fast-tier classification) is caught by the
+#      independent runtime verification, not trusted because of its markers
+#                                                    -> verify exits 1
 #
 # Nothing here compiles or runs a contract test: the fixture is a throwaway
 # workspace, so this suite costs a fraction of a second and belongs in the fast
@@ -329,6 +333,76 @@ else
   fail=$((fail + 1))
   echo "FAIL: bootstrap discarded a hand-written reason"
 fi
+
+# ── 11. A slow test disguised with fast-tier markers is caught ──────────────
+# Regression check for #1456. The tiering mechanism classifies by attribute
+# (the manifest's `tier` field, which a contributor sets directly), so a test
+# can be *labelled* fast without being fast. This seeds exactly that: a test
+# whose name looks fast (`test_quick_*`) and whose manifest entry says
+# `tier = "fast"`, but whose measured runtime blows past the fast tier's
+# budget. The independent runtime verification must flag it regardless of how
+# it was classified, and the flag must be a visible, attributable failure.
+DISGUISED="$REPO/contracts/demo/src/test_quick_disguised.rs"
+printf '#[test]\nfn quick_disguised() {\n    for _ in 0..100000000 {}\n}\n' > "$DISGUISED"
+printf 'mod test_alpha;\nmod test_beta;\nmod test_cheap;\nmod test_slow;\nmod test_quick_disguised;\n' \
+  > "$REPO/contracts/demo/src/lib.rs"
+python3 - "$MANIFEST" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+text += (
+    '\n[[unit]]\n'
+    'id = "contracts/demo/src/test_quick_disguised.rs"\n'
+    'kind = "smoke"\n'
+    'tier = "fast"\n'
+)
+path.write_text(text)
+PY
+
+# The manifest alone considers it fast: classification is attribute-based and
+# does not look at runtime, so `check` passes. That is the gap being guarded.
+run_tool "a fast-labelled slow test still passes the attribute-only check" 0 check
+
+# Runtime verification measures the fast tier and flags the disguised test.
+DISGUISED_RESULTS="$TMP_DIR/disguised.tsv"
+printf 'contracts/demo/src/test_alpha.rs\tpass\t0.4\ncontracts/demo/src/test_cheap.rs\tpass\t0.3\ncontracts/demo/src/test_quick_disguised.rs\tpass\t180.0\n' \
+  > "$DISGUISED_RESULTS"
+run_tool "runtime verification flags a disguised slow fast-tier test" 1 \
+  verify --tier fast --results "$DISGUISED_RESULTS" --output "$TMP_DIR/verify.md"
+assert_contains "contracts/demo/src/test_quick_disguised.rs"
+assert_contains "fast"
+assert_contains "180.0"
+# The flag must be attributable: it names the offending unit and the tier it
+# was wrongly classified into, so a reviewer can act on it.
+assert_contains "reclassif"
+if grep -Fq "test_quick_disguised.rs" "$TMP_DIR/verify.md"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL: the verification report must name the flagged unit for review"
+fi
+
+# A fast tier whose measured runtimes are all within budget is not flagged.
+run_tool "runtime verification passes a genuinely fast tier" 0 \
+  verify --tier fast --results "$WITHIN" --output "$TMP_DIR/verify.md"
+
+# Clean up the seeded unit so later assertions see the original inventory.
+rm "$DISGUISED"
+printf 'mod test_alpha;\nmod test_beta;\nmod test_cheap;\nmod test_slow;\n' \
+  > "$REPO/contracts/demo/src/lib.rs"
+python3 - "$MANIFEST" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text().replace(
+    '\n[[unit]]\n'
+    'id = "contracts/demo/src/test_quick_disguised.rs"\n'
+    'kind = "smoke"\n'
+    'tier = "fast"\n',
+    '')
+path.write_text(text)
+PY
 
 echo ""
 echo "$pass passed, $fail failed"

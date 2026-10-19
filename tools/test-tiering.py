@@ -45,6 +45,7 @@ Usage:
     python3 tools/test-tiering.py bootstrap --write     # re-generate the unit section of the manifest
     python3 tools/test-tiering.py plan --tier fast      # print the commands for one tier
     python3 tools/test-tiering.py report --tier fast --results <tsv> --output <md>
+    python3 tools/test-tiering.py verify-runtime --tier fast --results <tsv>
     python3 tools/test-tiering.py selftest              # unit tests for this checker
 
 `scripts/test-tier.sh` is the developer-facing wrapper around `plan` + `report`;
@@ -1066,6 +1067,153 @@ def human_seconds(value: float) -> str:
     return f"{value:.1f}s" if value < 600 else f"{int(value // 60)}m{int(value % 60):02d}s"
 
 
+# ── runtime verification: measured cost, not declared markers ─────────────────
+#
+# The tier a unit is *classified* into is a declaration: it comes from the
+# manifest, which a contributor can set (or mis-set) by hand. The tier a unit
+# *belongs* in is a measurement. `verify-runtime` closes that gap: it takes the
+# measured wall-clock of every unit in a tier and flags any unit whose own
+# runtime exceeds that tier's per-unit budget by a meaningful margin, no matter
+# what its name, kind, or manifest entry says. A slow test wearing fast-tier
+# markers is caught here even though the classification gate cannot see it.
+#
+# The flag is not a silent report: it is a required-review marker. `verify-runtime`
+# exits non-zero, and `report` fails the run, until the unit is either moved to a
+# slower tier (with the usual `reviewed` annotation) or the overrun is explicitly
+# waived with a `reviewed` annotation on the unit. Either way a human signs off.
+
+# How far over the per-unit budget a unit must be before it is flagged. A unit
+# that is merely close to the budget is noise (shared-runner jitter); a unit
+# that is this much over is a genuine misclassification.
+RUNTIME_OVERRUN_MARGIN = 1.5
+# Absolute floor: a unit that runs for less than this is never flagged, even if
+# it is over the (tiny) per-unit budget, because sub-second noise dominates.
+RUNTIME_OVERRUN_FLOOR_SECONDS = 2.0
+
+
+class RuntimeFlag:
+    """A unit whose measured runtime does not fit the tier it was classified in."""
+
+    def __init__(self, uid: str, tier: str, seconds: float, budget: float,
+                 proposed_tier: str, reviewed: dict | None) -> None:
+        self.id = uid
+        self.tier = tier
+        self.seconds = seconds
+        self.budget = budget
+        self.proposed_tier = proposed_tier
+        self.reviewed = reviewed
+
+    @property
+    def waived(self) -> bool:
+        return self.reviewed is not None
+
+    def action(self) -> str:
+        """The visible, attributable action this flag demands."""
+        if self.waived:
+            by = self.reviewed.get("by", "?")
+            on = self.reviewed.get("on", "?")
+            return (f"waived by {by} on {on}: overrun accepted, keep in `{self.tier}`")
+        return (f"REQUIRED REVIEW: move `{self.id}` from `{self.tier}` to "
+                f"`{self.proposed_tier}` (or record `reviewed = {{ by = \"…\", on = \"#…\" }}` "
+                f"on the unit to waive)")
+
+    def __str__(self) -> str:
+        return (f"{self.id}: {human_seconds(self.seconds)} in `{self.tier}` "
+                f"(per-unit budget {human_seconds(self.budget)}, "
+                f"{self.seconds / self.budget:.1f}x)")
+
+
+def per_unit_budget(manifest: dict, tier: str) -> float:
+    """The per-unit time budget for a tier.
+
+    The tier's `execution_budget_seconds` is the budget for the whole tier, so
+    the per-unit budget is that divided by the number of units in the tier. A
+    single unit that eats the whole tier budget is exactly the misclassification
+    this check exists to catch.
+    """
+    table = manifest.get("tiers", {}).get(tier, {})
+    total = float(table.get("execution_budget_seconds", 0) or 0)
+    count = sum(1 for unit in manifest.get("unit", []) if unit.get("tier") == tier)
+    return total / count if count else total
+
+
+def proposed_tier_for(tier: str) -> str:
+    """The next slower tier a flagged unit should move to."""
+    if tier not in EXECUTION_TIERS:
+        return EXECUTION_TIERS[-1]
+    index = EXECUTION_TIERS.index(tier)
+    return EXECUTION_TIERS[min(index + 1, len(EXECUTION_TIERS) - 1)]
+
+
+def verify_runtime(manifest: dict, tier: str, results: dict[str, dict],
+                   margin: float = RUNTIME_OVERRUN_MARGIN,
+                   floor: float = RUNTIME_OVERRUN_FLOOR_SECONDS) -> list[RuntimeFlag]:
+    """Flag units in `tier` whose measured runtime exceeds the per-unit budget.
+
+    Classification is deliberately ignored: the only inputs are the measured
+    seconds and the tier's budget. A unit whose manifest entry claims `fast`
+    but which measures 30s against a 5s per-unit budget is flagged, whatever
+    its name or kind says.
+    """
+    budget = per_unit_budget(manifest, tier)
+    if budget <= 0:
+        return []
+    threshold = max(budget * margin, floor)
+    flags = []
+    for entry in manifest.get("unit", []):
+        if entry.get("tier") != tier:
+            continue
+        result = results.get(entry["id"])
+        if result is None:
+            continue
+        seconds = float(result.get("seconds", 0.0))
+        if seconds > threshold:
+            flags.append(RuntimeFlag(entry["id"], tier, seconds, budget,
+                                     proposed_tier_for(tier), entry.get("reviewed")))
+    flags.sort(key=lambda flag: -flag.seconds)
+    return flags
+
+
+def verify_runtime_report(root: Path, tier: str, results_path: Path,
+                          margin: float, floor: float, output: Path | None) -> int:
+    """Render the runtime-verification report and return the exit code."""
+    manifest = load_manifest(root / MANIFEST_NAME)
+    results = read_results(results_path)
+    flags = verify_runtime(manifest, tier, results, margin, floor)
+    budget = per_unit_budget(manifest, tier)
+    unwaived = [flag for flag in flags if not flag.waived]
+
+    lines = [f"# Runtime verification — {tier}", ""]
+    lines.append(f"Per-unit budget: {human_seconds(budget)} "
+                 f"(tier budget / units in tier) · flag threshold: "
+                 f"{human_seconds(max(budget * margin, floor))} "
+                 f"({margin:g}x, floor {human_seconds(floor)})")
+    lines.append("")
+    if not flags:
+        lines += ["No unit in this tier exceeds its measured budget. "
+                  "Every fast-tier unit is genuinely fast.", ""]
+    else:
+        lines += ["| Unit | Measured | Budget | Overrun | Action |",
+                  "|---|---|---|---|---|"]
+        for flag in flags:
+            lines.append(f"| `{flag.id}` | {human_seconds(flag.seconds)} | "
+                         f"{human_seconds(flag.budget)} | "
+                         f"{flag.seconds / flag.budget:.1f}x | {flag.action()} |")
+        lines.append("")
+        if unwaived:
+            lines += [f"> **{len(unwaived)} unit(s) require review.** A test classified into "
+                      f"`{tier}` measured far over its budget. Move it to a slower tier in "
+                      f"`{MANIFEST_NAME}`, or record a `reviewed` annotation to waive the "
+                      f"overrun. This is not a silent report: the run fails until it is "
+                      f"resolved.", ""]
+    text = "\n".join(lines)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(text)
+    print(text)
+    return 1 if unwaived else 0
+
+
 def report(root: Path, tier: str, results_path: Path, base: str | None,
            output: Path | None, no_budget: bool, build_seconds: float) -> int:
     manifest = load_manifest(root / MANIFEST_NAME)
@@ -1370,6 +1518,62 @@ class TierCheckerSelfTest(unittest.TestCase):
         code = report(self.root, "fast", results, None, None, no_budget=False, build_seconds=1.0)
         self.assertEqual(code, 1)
 
+    def test_verify_runtime_flags_disguised_slow_test(self) -> None:
+        # A test classified `fast` (fast-tier name, fast-tier kind) that actually
+        # takes far longer than the per-unit budget must be flagged, regardless
+        # of how it was classified.
+        manifest = load_manifest(self.root / MANIFEST_NAME)
+        results = {
+            "contracts/demo/src/test_smoke.rs": {"status": "pass", "seconds": 0.5},
+            "contracts/demo/src/test_cheap.rs": {"status": "pass", "seconds": 30.0},
+        }
+        flags = verify_runtime(manifest, "fast", results)
+        self.assertEqual([flag.id for flag in flags],
+                         ["contracts/demo/src/test_cheap.rs"],
+                         "a slow test disguised as fast must be flagged")
+        self.assertEqual(flags[0].proposed_tier, "standard")
+        self.assertIn("REQUIRED REVIEW", flags[0].action())
+
+    def test_verify_runtime_ignores_fast_units(self) -> None:
+        manifest = load_manifest(self.root / MANIFEST_NAME)
+        results = {
+            "contracts/demo/src/test_smoke.rs": {"status": "pass", "seconds": 0.5},
+            "contracts/demo/src/test_cheap.rs": {"status": "pass", "seconds": 0.6},
+        }
+        self.assertEqual(verify_runtime(manifest, "fast", results), [])
+
+    def test_verify_runtime_waiver_is_attributable(self) -> None:
+        manifest = load_manifest(self.root / MANIFEST_NAME)
+        for entry in manifest["unit"]:
+            if entry["id"].endswith("test_cheap.rs"):
+                entry["reviewed"] = {"by": "maintainer", "on": "#1456"}
+        results = {"contracts/demo/src/test_cheap.rs": {"status": "pass", "seconds": 30.0}}
+        flags = verify_runtime(manifest, "fast", results)
+        self.assertEqual(len(flags), 1)
+        self.assertTrue(flags[0].waived)
+        self.assertIn("waived by maintainer", flags[0].action())
+
+    def test_verify_runtime_report_fails_on_unwaived_flag(self) -> None:
+        results = self.root / "results.tsv"
+        results.write_text("contracts/demo/src/test_smoke.rs\tpass\t0.5\n"
+                           "contracts/demo/src/test_cheap.rs\tpass\t30.0\n")
+        code = verify_runtime_report(self.root, "fast", results,
+                                     RUNTIME_OVERRUN_MARGIN, RUNTIME_OVERRUN_FLOOR_SECONDS,
+                                     self.root / "verify.md")
+        self.assertEqual(code, 1, "an unwaived overrun must fail verification")
+        text = (self.root / "verify.md").read_text()
+        self.assertIn("REQUIRED REVIEW", text)
+        self.assertIn("contracts/demo/src/test_cheap.rs", text)
+
+    def test_verify_runtime_report_passes_when_clean(self) -> None:
+        results = self.root / "results.tsv"
+        results.write_text("contracts/demo/src/test_smoke.rs\tpass\t0.5\n"
+                           "contracts/demo/src/test_cheap.rs\tpass\t0.6\n")
+        code = verify_runtime_report(self.root, "fast", results,
+                                     RUNTIME_OVERRUN_MARGIN, RUNTIME_OVERRUN_FLOOR_SECONDS,
+                                     None)
+        self.assertEqual(code, 0)
+
     def test_plan_emits_one_command_per_unit(self) -> None:
         import contextlib
         import io
@@ -1442,6 +1646,18 @@ def main(argv: list[str] | None = None) -> int:
     report_parser.add_argument("--build-seconds", type=float, default=0.0,
                                help="build wall-clock, recorded in the report")
 
+    verify_parser = sub.add_parser(
+        "verify-runtime",
+        help="flag units whose measured runtime exceeds their tier's per-unit budget")
+    verify_parser.add_argument("--tier", required=True, choices=list(EXECUTION_TIERS))
+    verify_parser.add_argument("--results", type=Path, required=True,
+                               help="TSV of `<id>\\t<status>\\t<seconds>[\\t<log>]`")
+    verify_parser.add_argument("--output", type=Path, help="markdown report path")
+    verify_parser.add_argument("--margin", type=float, default=RUNTIME_OVERRUN_MARGIN,
+                               help="flag units over this multiple of the per-unit budget")
+    verify_parser.add_argument("--floor", type=float, default=RUNTIME_OVERRUN_FLOOR_SECONDS,
+                               help="never flag a unit faster than this many seconds")
+
     sub.add_parser("selftest", help="run this checker's own tests")
     args = parser.parse_args(argv)
 
@@ -1468,6 +1684,9 @@ def dispatch(args, root: Path, argv: list[str]) -> int:
     if args.command == "report":
         return report(root, args.tier, args.results, args.base, args.output,
                       args.no_budget, args.build_seconds)
+    if args.command == "verify-runtime":
+        return verify_runtime_report(root, args.tier, args.results, args.margin,
+                                     args.floor, args.output)
     if args.command == "selftest":
         return selftest()
     return 2

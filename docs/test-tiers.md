@@ -83,6 +83,53 @@ default tiers:
 The tiers **partition** the suite. `fast ∪ standard ∪ nightly` is exactly the set of units a
 cargo target compiles; a unit belongs to exactly one tier.
 
+### What the tier is actually based on
+
+**Classification is attribute-based, not measurement-based.** A unit's tier is the `tier`
+field a contributor (or the bootstrap heuristic) wrote into `test-tiers.toml`; nothing in the
+planner measures how long a unit takes before deciding where it belongs. The `kind` → default
+`tier` mapping in the table above is a convention, and the bootstrap proposes a `kind` from
+naming and file layout — a file called `test_foo.rs` in `src/` is proposed as `unit`/`fast`
+because of what it is called and where it lives, not because it was timed. A contributor can
+therefore put a genuinely slow test in `fast` by writing `tier = "fast"`, and the manifest
+gate (`check`) will accept it: it verifies that the entry exists, that a deviation carries a
+`reason`, and that a tier move carries a `reviewed` annotation, but it does not know how long
+the unit runs.
+
+That is a deliberate trade — measuring every unit on every PR would cost more than the tiers
+save — but it means the fast tier's 180s budget is only as honest as the classifications
+feeding it. The independent runtime verification below exists to keep that honest.
+
+### Independent runtime verification
+
+`scripts/test-tier.sh fast` records a measured duration for every unit it runs in
+`target/test-tiers/fast-results.tsv`. `tools/test-tiering.py verify-runtime` reads that file
+and compares each measured duration against the fast tier's execution budget, **regardless of
+how the unit was classified** — the check never consults the `kind` or the `note`, only the
+clock:
+
+```bash
+python3 tools/test-tiering.py verify-runtime --results target/test-tiers/fast-results.tsv
+```
+
+A unit whose measured runtime exceeds the fast budget by a meaningful margin (the check uses
+a tolerance so that a unit sitting at 179s of a 180s budget is not flagged for noise) is
+reported as **over budget**. The check exits non-zero, so it fails the `test-tiers-fast` job
+rather than printing a report nobody reads.
+
+The failure is attributable and actionable, not silent:
+
+- the report names the offending unit, its measured duration, and the fast budget it blew;
+- the job fails, so the PR that introduced or kept the slow unit cannot merge green;
+- the fix is a tier move — the unit is re-classified out of `fast` (to `standard` or
+  `nightly`) with a `reason`, which is itself a `reviewed` change under § Moving a test
+  between tiers, so a second pair of eyes sees the re-classification. The verification step
+  therefore produces a *re-classification proposal* that a maintainer must review and commit;
+  it never silently re-writes the manifest itself.
+
+Because the check is driven by measured results rather than by the manifest, it catches the
+case the manifest gate cannot: a test that is honestly labelled `fast` but is not fast.
+
 ### Deviations
 
 A unit may sit in a different tier from its kind's default, but only with a `reason` on the
@@ -141,6 +188,7 @@ scripts/test-tier.sh <fast|standard|nightly> [options]
 | `--fail-fast` | Stop at the first failing unit instead of running the whole tier. |
 | `--list` | Print the units in the tier and exit. |
 | `--dry-run` | Print the commands the tier would run and exit. |
+| `--verify-runtime` | After the run, check measured fast-tier durations against the fast budget and fail on any over-budget unit (§ Independent runtime verification). |
 | `-- <args>` | Append arguments to every command in the tier (`-- --nocapture`). |
 
 What the runner does, in order:
@@ -153,7 +201,10 @@ What the runner does, in order:
 4. writes `target/test-tiers/<tier>-results.tsv`, one row per unit with its status and
    duration, and per-unit logs under `target/test-tiers/logs/<tier>/`;
 5. renders `target/test-tiers/<tier>-report.md` and exits non-zero if a unit failed, a unit
-   did not run, the tier exceeded its budget, or a tier moved without review.
+   did not run, the tier exceeded its budget, or a tier moved without review;
+6. for the `fast` tier, runs the independent runtime verification (§ Independent runtime
+   verification) and exits non-zero if any unit's *measured* duration exceeds the fast budget,
+   whatever its classification says.
 
 The report is the artifact to paste into a PR that touched a tier.
 
@@ -175,7 +226,7 @@ them. Two exceptions are deliberate:
 | Job | Workflow | Command |
 |---|---|---|
 | `test-tiers-manifest` | `.github/workflows/ci.yml` | `python3 tools/test-tiering.py check --base <base sha>` |
-| `test-tiers-fast` | `.github/workflows/ci.yml` | `scripts/test-tier.sh fast --base <base sha>` |
+| `test-tiers-fast` | `.github/workflows/ci.yml` | `scripts/test-tier.sh fast --base <base sha> --verify-runtime` |
 | `test-tiers-standard` | `.github/workflows/ci.yml` | `scripts/test-tier.sh standard --base <base sha>` |
 | `nightly` | `.github/workflows/nightly-tests.yml` | `scripts/test-tier.sh nightly` |
 
@@ -261,6 +312,16 @@ to pin it so it cannot change silently. Triage is follow-up work:
    suites. This is deliberate work with a reviewer, not a mechanical edit — the bootstrap
    cannot classify a suite that does not compile.
 
+## The tiering tool's own tests
+
+The tiering tool is itself tested, and one of those tests is a permanent regression check for
+the failure mode above: a **seeded, deliberately slow test disguised with fast-tier markers**
+(a fast-looking name and a `fast` classification) is fed to `verify-runtime`, and the suite
+asserts that the verification step flags it and exits non-zero. If a future change makes the
+verification step trust the manifest instead of the clock, that test fails. The seeded case
+lives in the tool's own test suite (`tools/tests/`), not in the manifest, so it never runs as
+part of a real tier.
+
 ## Benchmarks
 
 The 16 `[[benchmark]]` entries in the manifest are classified and checked for existence, but
@@ -271,7 +332,8 @@ where it is; mixing it into a tier budget would make the budget meaningless.
 
 ## What this change does not do
 
-- It does not re-calibrate the budgets from measured runs (§ Budgets).
+- It does not re-calibrate the budgets from measured runs (§ Budgets). Runtime verification
+  flags over-budget units; it does not rewrite the budget or the manifest.
 - It does not wire, delete, or fix the 87 disabled units (§ Disabled inventory).
 - It does not change any public ABI, storage layout, error discriminant, or event. No contract
   code is modified by this change.

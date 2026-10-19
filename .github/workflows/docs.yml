@@ -39,6 +39,12 @@ jobs:
       - name: Broken internal links fail CI
         run: python3 tools/docs-site/check_links.py
 
+      - name: Machine-readable artifact index is complete and fresh
+        # Issue #1457: fails if a generated artifact is missing from the index
+        # or if a published artifact has drifted from what regenerating it
+        # from current source would produce.
+        run: python3 tools/docs-site/check_artifacts.py --check
+
       - name: Spelling and terminology (glossary terms in _typos.toml)
         uses: crate-ci/typos@v1.24.6
         continue-on-error: true
@@ -79,6 +85,8 @@ jobs:
       - name: Build site
         run: |
           python3 tools/docs-site/build.py --version "${{ steps.ver.outputs.label }}"
+          # Issue #1457: publish the machine-readable artifact index with the site.
+          python3 tools/docs-site/check_artifacts.py --render target/docs-site/src/artifacts.md
           mdbook build target/docs-site
           cargo doc -p ledgerlens-score --no-deps
           cp -r target/doc/. target/docs-site/book/api/
